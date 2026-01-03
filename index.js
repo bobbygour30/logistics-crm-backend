@@ -401,5 +401,25 @@ app.post('/api/ivr-calls', async (req, res) => {
   }
 });
 
+// Handle root URL - return a simple message or API info
+app.get('/', (req, res) => {
+  res.json({
+    message: 'Logistics CRM Backend API is running!',
+    endpoints: {
+      create_ticket: 'POST /api/create-ticket',
+      tickets: 'GET /api/tickets',
+      agents: 'GET /api/agents',
+      customers: 'GET /api/customers',
+      open_tickets: 'GET /api/open-tickets',
+      ivr_calls: 'POST /api/ivr-calls',
+    },
+    docs: 'All API routes are under /api/*',
+  });
+});
+
+// Optional: Catch-all for unknown routes
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
 // Export the app for Vercel serverless
 module.exports = app;
