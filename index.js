@@ -421,5 +421,9 @@ app.get('/', (req, res) => {
 app.use('*', (req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
+
+app.listen(3000, () => {
+  console.log(`Server is running on port 3000`);
+})
 // Export the app for Vercel serverless
 module.exports = app;
