@@ -1,3 +1,5 @@
+// index.js - Fixed for Vercel Serverless Functions (Express-style app exported)
+
 const { MongoClient, ObjectId } = require('mongodb');
 const express = require('express');
 const cors = require('cors');
@@ -6,22 +8,49 @@ const { nanoid } = require('nanoid');
 
 dotenv.config();
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+// Use a global cached client to avoid reconnecting on every request (important for serverless)
+let cachedClient = null;
+let cachedDb = null;
 
 const uri = process.env.MONGO_URI;
-const client = new MongoClient(uri);
 
-async function connect() {
-  await client.connect();
-  console.log('Connected to MongoDB');
+async function connectToDatabase() {
+  if (cachedDb) return cachedDb;
+
+  if (!cachedClient) {
+    cachedClient = new MongoClient(uri, {
+      // Recommended settings for serverless
+      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 20000,
+    });
+    await cachedClient.connect();
+    console.log('Connected to MongoDB Atlas');
+  }
+
+  cachedDb = cachedClient.db('ticketdb');
+  return cachedDb;
 }
-connect().catch(console.error);
 
+// Create Express app
+const app = express();
+
+// Middleware
+app.use(cors({
+  origin: '*', // Adjust for production (e.g., your frontend domain)
+}));
+app.use(express.json());
+
+// Global error handler (good practice)
+app.use((err, req, res, next) => {
+  console.error('Global error:', err);
+  res.status(500).json({ error: 'Internal server error', details: err.message });
+});
+
+// POST /api/create-ticket
 app.post('/api/create-ticket', async (req, res) => {
   try {
-    const db = client.db('ticketdb');
+    const db = await connectToDatabase();
     const body = req.body;
 
     if (!body.customer_name || !body.ticket_title) {
@@ -40,27 +69,22 @@ app.post('/api/create-ticket', async (req, res) => {
     let customer;
 
     if (customerData.email) {
-      // Upsert customer by email (update if exists, insert if not)
       await db.collection('customers').updateOne(
         { email: customerData.email },
         { $set: customerData },
         { upsert: true }
       );
 
-      // Now fetch the customer (guaranteed to exist)
       customer = await db.collection('customers').findOne({ email: customerData.email });
     } else {
-      // No email → always create new customer
       const insertResult = await db.collection('customers').insertOne(customerData);
       customer = { _id: insertResult.insertedId, ...customerData };
     }
 
-    // Final safety check (should never fail now)
     if (!customer || !customer._id) {
-      throw new Error('Failed to create or retrieve customer after upsert');
+      throw new Error('Failed to create or retrieve customer');
     }
 
-    // Generate ticket number
     const ticket_number = 'TKT-' + nanoid(8).toUpperCase();
 
     const ticketData = {
@@ -81,7 +105,6 @@ app.post('/api/create-ticket', async (req, res) => {
 
     const ticketResult = await db.collection('tickets').insertOne(ticketData);
 
-    // Build response
     const responseTicket = {
       id: ticketResult.insertedId.toString(),
       ticket_number: ticketData.ticket_number,
@@ -112,16 +135,67 @@ app.post('/api/create-ticket', async (req, res) => {
     res.json({ success: true, ticket: responseTicket });
   } catch (err) {
     console.error('Create ticket error:', err);
-    res.status(500).json({ 
-      error: 'Internal server error', 
-      details: err.message || 'Unknown error' 
-    });
+    res.status(500).json({ error: 'Internal server error', details: err.message });
   }
 });
-// GET active agents
+
+// GET /api/tickets
+app.get('/api/tickets', async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const tickets = await db.collection('tickets')
+      .aggregate([
+        {
+          $lookup: {
+            from: 'customers',
+            localField: 'customer_id',
+            foreignField: '_id',
+            as: 'customers'
+          }
+        },
+        { $unwind: { path: '$customers', preserveNullAndEmptyArrays: true } },
+        { $sort: { created_at: -1 } }
+      ])
+      .toArray();
+
+    const formattedTickets = tickets.map(ticket => ({
+      id: ticket._id.toString(),
+      ticket_number: ticket.ticket_number,
+      customer_id: ticket.customer_id?.toString() || null,
+      assigned_to: ticket.assigned_to || null,
+      title: ticket.title,
+      description: ticket.description,
+      type: ticket.type,
+      status: ticket.status,
+      priority: ticket.priority,
+      source: ticket.source,
+      tracking_number: ticket.tracking_number,
+      created_at: ticket.created_at,
+      updated_at: ticket.updated_at,
+      closed_at: ticket.closed_at,
+      customers: ticket.customers ? {
+        id: ticket.customers._id.toString(),
+        name: ticket.customers.name,
+        email: ticket.customers.email,
+        phone: ticket.customers.phone,
+        company_name: ticket.customers.company_name,
+        address: ticket.customers.address,
+        created_at: ticket.customers.created_at,
+      } : null,
+      agents: null,
+    }));
+
+    res.json({ tickets: formattedTickets });
+  } catch (err) {
+    console.error('Error fetching tickets:', err);
+    res.status(500).json({ error: 'Failed to fetch tickets', details: err.message });
+  }
+});
+
+// GET /api/agents
 app.get('/api/agents', async (req, res) => {
   try {
-    const db = client.db('ticketdb');
+    const db = await connectToDatabase();
     const agents = await db.collection('agents').find({ is_active: true })
       .sort({ name: 1 })
       .toArray();
@@ -138,14 +212,14 @@ app.get('/api/agents', async (req, res) => {
     res.json({ agents: formatted });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to fetch agents' });
+    res.status(500).json({ error: 'Failed to fetch agents', details: err.message });
   }
 });
 
-// GET comments for a ticket
+// GET /api/tickets/:id/comments
 app.get('/api/tickets/:id/comments', async (req, res) => {
   try {
-    const db = client.db('ticketdb');
+    const db = await connectToDatabase();
     const comments = await db.collection('ticket_comments')
       .aggregate([
         { $match: { ticket_id: new ObjectId(req.params.id) } },
@@ -180,14 +254,14 @@ app.get('/api/tickets/:id/comments', async (req, res) => {
     res.json({ comments: formatted });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to fetch comments' });
+    res.status(500).json({ error: 'Failed to fetch comments', details: err.message });
   }
 });
 
-// POST new comment
+// POST /api/tickets/:id/comments
 app.post('/api/tickets/:id/comments', async (req, res) => {
   try {
-    const db = client.db('ticketdb');
+    const db = await connectToDatabase();
     const { comment, is_internal = false, agent_id = null } = req.body;
 
     const result = await db.collection('ticket_comments').insertOne({
@@ -205,10 +279,10 @@ app.post('/api/tickets/:id/comments', async (req, res) => {
   }
 });
 
-// PATCH update ticket
+// PATCH /api/tickets/:id
 app.patch('/api/tickets/:id', async (req, res) => {
   try {
-    const db = client.db('ticketdb');
+    const db = await connectToDatabase();
     const updates = req.body;
 
     if (updates.assigned_to === '') updates.assigned_to = null;
@@ -234,64 +308,11 @@ app.patch('/api/tickets/:id', async (req, res) => {
     res.status(500).json({ error: 'Failed to update ticket', details: err.message });
   }
 });
-// GET all tickets with customer data
-app.get('/api/tickets', async (req, res) => {
-  try {
-    const db = client.db('ticketdb');
-    const tickets = await db.collection('tickets')
-      .aggregate([
-        {
-          $lookup: {
-            from: 'customers',
-            localField: 'customer_id',
-            foreignField: '_id',
-            as: 'customers'
-          }
-        },
-        { $unwind: { path: '$customers', preserveNullAndEmptyArrays: true } },
-        { $sort: { created_at: -1 } }
-      ])
-      .toArray();
 
-    // Convert ObjectId to string and clean up response
-    const formattedTickets = tickets.map(ticket => ({
-      id: ticket._id.toString(),
-      ticket_number: ticket.ticket_number,
-      customer_id: ticket.customer_id?.toString() || null,
-      assigned_to: ticket.assigned_to || null,
-      title: ticket.title,
-      description: ticket.description,
-      type: ticket.type,
-      status: ticket.status,
-      priority: ticket.priority,
-      source: ticket.source,
-      tracking_number: ticket.tracking_number,
-      created_at: ticket.created_at,
-      updated_at: ticket.updated_at,
-      closed_at: ticket.closed_at,
-      customers: ticket.customers ? {
-        id: ticket.customers._id.toString(),
-        name: ticket.customers.name,
-        email: ticket.customers.email,
-        phone: ticket.customers.phone,
-        company_name: ticket.customers.company_name,
-        address: ticket.customers.address,
-        created_at: ticket.customers.created_at,
-      } : null,
-      agents: null, // You can add agent lookup later if needed
-    }));
-
-    res.json({ tickets: formattedTickets });
-  } catch (err) {
-    console.error('Error fetching tickets:', err);
-    res.status(500).json({ error: 'Failed to fetch tickets' });
-  }
-});
-
-// GET all customers (for dropdown)
+// GET /api/customers
 app.get('/api/customers', async (req, res) => {
   try {
-    const db = client.db('ticketdb');
+    const db = await connectToDatabase();
     const customers = await db.collection('customers')
       .find({})
       .sort({ name: 1 })
@@ -310,14 +331,14 @@ app.get('/api/customers', async (req, res) => {
     res.json({ customers: formatted });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to fetch customers' });
+    res.status(500).json({ error: 'Failed to fetch customers', details: err.message });
   }
 });
 
-// GET recent open/working tickets
+// GET /api/open-tickets
 app.get('/api/open-tickets', async (req, res) => {
   try {
-    const db = client.db('ticketdb');
+    const db = await connectToDatabase();
     const tickets = await db.collection('tickets')
       .aggregate([
         { $match: { status: { $in: ['open', 'working'] } } },
@@ -349,14 +370,14 @@ app.get('/api/open-tickets', async (req, res) => {
     res.json({ tickets: formatted });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to fetch tickets' });
+    res.status(500).json({ error: 'Failed to fetch tickets', details: err.message });
   }
 });
 
-// POST log IVR call
+// POST /api/ivr-calls
 app.post('/api/ivr-calls', async (req, res) => {
   try {
-    const db = client.db('ticketdb');
+    const db = await connectToDatabase();
     const data = req.body;
 
     if (!data.phone_number || !data.call_duration || !data.call_type) {
@@ -380,5 +401,5 @@ app.post('/api/ivr-calls', async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server running on port ${port}`));
+// Export the app for Vercel serverless
+module.exports = app;
